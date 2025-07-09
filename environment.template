@@ -1,0 +1,38 @@
+# Claude Code MCP Server Environment Configuration
+# Copy this file to /etc/claude-mcp/environment and update values
+
+# API Keys (REQUIRED - replace with your actual keys)
+ANTHROPIC_API_KEY=your-anthropic-api-key-here
+
+# Server Configuration
+MCP_TRANSPORT=sse
+PORT=3456
+NODE_ENV=production
+
+# Session Management
+MAX_SESSIONS=100
+SESSION_TIMEOUT_MS=3600000
+CLEANUP_INTERVAL_MS=300000
+
+# Process Management
+EXECUTION_TIMEOUT_MS=1800000
+MAX_ASYNC_PROCESSES=50
+ASYNC_PROCESS_TIMEOUT_MS=1800000
+
+# Claude CLI Configuration
+# CLAUDE_CLI_NAME=/usr/local/bin/claude
+
+# Input Validation
+MAX_PROMPT_LENGTH=50000
+
+# Logging Configuration
+MCP_CLAUDE_DEBUG=false
+LOG_FORMAT=json
+
+# Letta Integration (optional)
+# LETTA_BASE_URL=https://letta2.oculair.ca
+# LETTA_AUTH_TOKEN=your-letta-auth-token
+# LETTA_BARE_PASSWORD=your-letta-bare-password
+
+# Additional Security Settings
+# NODE_OPTIONS=--max-old-space-size=2048
