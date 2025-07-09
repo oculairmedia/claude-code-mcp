@@ -286,6 +286,11 @@ export class ClaudeCodeServer {
                 type: 'boolean',
                 description: 'Whether to elevate this task block to prevent cleanup. Use for important long-running tasks.',
               },
+              request_heartbeat: {
+                type: 'boolean',
+                description: 'Whether to request periodic heartbeat updates during long-running tasks. Defaults to true.',
+                default: true,
+              },
             },
             required: ['prompt', 'agentId'],
           },
@@ -348,6 +353,7 @@ export class ClaudeCodeServer {
         let lettaUrl: string = 'https://letta.oculair.ca';
         let keepTaskBlocks: number = 3;
         let elevateBlock: boolean = false;
+        let requestHeartbeat: boolean = true; // Default to true
 
         if (!toolArguments.agentId || typeof toolArguments.agentId !== 'string') {
           throw new McpError(ErrorCode.InvalidParams, 'Missing required parameter: agentId for claude_code_async tool');
@@ -364,6 +370,10 @@ export class ClaudeCodeServer {
 
         if (toolArguments.elevateBlock && typeof toolArguments.elevateBlock === 'boolean') {
           elevateBlock = toolArguments.elevateBlock;
+        }
+
+        if (toolArguments.request_heartbeat !== undefined && typeof toolArguments.request_heartbeat === 'boolean') {
+          requestHeartbeat = toolArguments.request_heartbeat;
         }
 
         // Create a unique task ID
@@ -384,13 +394,16 @@ export class ClaudeCodeServer {
           (taskStatus as any).keepTaskBlocks = keepTaskBlocks;
         }
         
+        // Store heartbeat preference
+        (taskStatus as any).requestHeartbeat = requestHeartbeat;
+        
         // Store task in Letta memory block with custom keep count
         memoryClient.updateTaskStatus(agentId, taskStatus).catch(error => {
           console.error(`[Async] Failed to create memory block for task ${taskId}:`, error);
         });
 
         // Start async execution with parameters
-        this.executeClaudeAsync(taskId, agentId, prompt, effectiveCwd, lettaUrl, keepTaskBlocks, elevateBlock).catch(error => {
+        this.executeClaudeAsync(taskId, agentId, prompt, effectiveCwd, lettaUrl, keepTaskBlocks, elevateBlock, requestHeartbeat).catch(error => {
           console.error(`[Async] Task ${taskId} failed:`, error);
           // Try to notify Letta about the failure
           sendResultToLetta({
@@ -476,7 +489,8 @@ export class ClaudeCodeServer {
     cwd: string,
     lettaUrl: string,
     keepTaskBlocks: number = 3,
-    elevateBlock: boolean = false
+    elevateBlock: boolean = false,
+    requestHeartbeat: boolean = true
   ): Promise<void> {
     console.error(`[Async] Starting task ${taskId} for agent ${agentId}`);
     
