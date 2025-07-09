@@ -8,12 +8,16 @@ import {
   McpError,
   type ServerResult,
 } from '@modelcontextprotocol/sdk/types.js';
-import { spawn } from 'node:child_process';
+import { spawn, ChildProcess } from 'node:child_process';
 import { existsSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join, resolve as pathResolve } from 'node:path';
 import * as path from 'path';
 import { readFileSync } from 'node:fs';
+import { randomUUID } from 'crypto';
+import { taskTracker } from './task-tracker.js';
+import { sendResultToLetta } from './letta-callback.js';
+import { memoryClient } from './letta-memory-client.js';
 
 // Server version - update this when releasing new versions
 const SERVER_VERSION = "1.10.12";
@@ -229,6 +233,62 @@ export class ClaudeCodeServer {
             },
             required: ['prompt'],
           },
+        },
+        {
+          name: 'claude_code_async',
+          description: `Async Claude Code Agent: Same as claude_code but runs asynchronously and notifies the calling Letta agent when complete.
+
+• Returns immediately with a task ID
+• Executes Claude Code in the background
+• Sends result back to the calling Letta agent via MCP
+
+**Required parameters:**
+• prompt: The task to execute
+• agentId: The Letta agent ID to notify when complete
+• lettaUrl: (optional) Letta base URL for the MCP endpoint, defaults to https://letta.oculair.ca
+
+**Example usage:**
+{
+  "prompt": "Analyze the codebase and generate a comprehensive README.md",
+  "agentId": "agent_123",
+  "workFolder": "/workspace"
+}
+
+**Response:**
+{
+  "taskId": "task_abc123",
+  "message": "Task started successfully. Will notify agent_123 when complete."
+}`,
+          inputSchema: {
+            type: 'object',
+            properties: {
+              prompt: {
+                type: 'string',
+                description: 'The detailed natural language prompt for Claude to execute.',
+              },
+              agentId: {
+                type: 'string',
+                description: 'The Letta agent ID to notify when the task completes.',
+              },
+              workFolder: {
+                type: 'string',
+                description: 'The working directory for the Claude CLI execution. Must be an absolute path.',
+              },
+              lettaUrl: {
+                type: 'string',
+                description: 'Letta MCP server URL. Defaults to https://letta.oculair.ca',
+              },
+              keepTaskBlocks: {
+                type: 'number',
+                description: 'Number of task blocks to keep in memory. Defaults to 3. Set higher for agents that track many concurrent tasks.',
+              },
+              elevateBlock: {
+                type: 'boolean',
+                description: 'Whether to elevate this task block to prevent cleanup. Use for important long-running tasks.',
+              },
+            },
+            required: ['prompt', 'agentId'],
+          },
         }
       ],
     }));
@@ -241,7 +301,7 @@ export class ClaudeCodeServer {
 
       // Correctly access toolName from args.params.name
       const toolName = args.params.name;
-      if (toolName !== 'claude_code') {
+      if (toolName !== 'claude_code' && toolName !== 'claude_code_async') {
         // ErrorCode.ToolNotFound should be ErrorCode.MethodNotFound as per SDK for tools
         throw new McpError(ErrorCode.MethodNotFound, `Tool ${toolName} not found`);
       }
@@ -278,6 +338,84 @@ export class ClaudeCodeServer {
         }
       } else {
         debugLog(`[Debug] No workFolder provided, using default CWD: ${effectiveCwd}`);
+      }
+
+
+      // Handle async tool separately
+      if (toolName === 'claude_code_async') {
+        // Validate async-specific parameters
+        let agentId: string;
+        let lettaUrl: string = 'https://letta.oculair.ca';
+        let keepTaskBlocks: number = 3;
+        let elevateBlock: boolean = false;
+
+        if (!toolArguments.agentId || typeof toolArguments.agentId !== 'string') {
+          throw new McpError(ErrorCode.InvalidParams, 'Missing required parameter: agentId for claude_code_async tool');
+        }
+        agentId = toolArguments.agentId;
+
+        if (toolArguments.lettaUrl && typeof toolArguments.lettaUrl === 'string') {
+          lettaUrl = toolArguments.lettaUrl;
+        }
+
+        if (toolArguments.keepTaskBlocks && typeof toolArguments.keepTaskBlocks === 'number') {
+          keepTaskBlocks = Math.max(1, Math.min(50, toolArguments.keepTaskBlocks)); // Limit between 1-50
+        }
+
+        if (toolArguments.elevateBlock && typeof toolArguments.elevateBlock === 'boolean') {
+          elevateBlock = toolArguments.elevateBlock;
+        }
+
+        // Create a unique task ID
+        const taskId = `task_${randomUUID()}`;
+        
+        // Store task info for tracking
+        taskTracker.createTask(taskId, agentId, prompt);
+
+        // Create enhanced task status in memory
+        const taskStatus = memoryClient.createEnhancedTaskStatus(taskId, agentId, prompt, effectiveCwd);
+        
+        // Add elevation flag if requested
+        if (elevateBlock) {
+          taskStatus.archive_priority = 'high';
+          taskStatus.should_archive = true;
+          // Store elevation info in the task status itself
+          (taskStatus as any).elevated = true;
+          (taskStatus as any).keepTaskBlocks = keepTaskBlocks;
+        }
+        
+        // Store task in Letta memory block with custom keep count
+        memoryClient.updateTaskStatus(agentId, taskStatus).catch(error => {
+          console.error(`[Async] Failed to create memory block for task ${taskId}:`, error);
+        });
+
+        // Start async execution with parameters
+        this.executeClaudeAsync(taskId, agentId, prompt, effectiveCwd, lettaUrl, keepTaskBlocks, elevateBlock).catch(error => {
+          console.error(`[Async] Task ${taskId} failed:`, error);
+          // Try to notify Letta about the failure
+          sendResultToLetta({
+            agentId,
+            taskId,
+            callbackUrl: lettaUrl,
+            result: `Task ${taskId} failed: ${error.message}`,
+            success: false,
+            error: error.message
+          }).catch(console.error);
+        });
+
+        // Return immediately with task ID
+        return {
+          content: [
+            {
+              type: 'text',
+              text: JSON.stringify({
+                taskId,
+                message: `Task started successfully. Will notify agent ${agentId} when complete.`,
+                status: 'running'
+              }, null, 2),
+            },
+          ],
+        };
       }
 
       try {
@@ -326,6 +464,107 @@ export class ClaudeCodeServer {
         throw new McpError(ErrorCode.InternalError, `Claude CLI execution failed: ${errorMessage}`);
       }
     });
+  }
+
+  /**
+   * Execute Claude CLI asynchronously and notify Letta agent when complete
+   */
+  private async executeClaudeAsync(
+    taskId: string,
+    agentId: string,
+    prompt: string,
+    cwd: string,
+    lettaUrl: string,
+    keepTaskBlocks: number = 3,
+    elevateBlock: boolean = false
+  ): Promise<void> {
+    console.error(`[Async] Starting task ${taskId} for agent ${agentId}`);
+    
+    try {
+      // Update task status to in_progress
+      await memoryClient.updateTaskProgress(agentId, taskId, {
+        progress: 'Executing Claude Code',
+        progress_percentage: 10,
+        current_step: 'Starting Claude CLI',
+        steps_completed: 0,
+        total_steps: 2
+      });
+
+      // Execute Claude CLI
+      const claudeProcessArgs = ['--dangerously-skip-permissions', '-p', prompt];
+      debugLog(`[Async] Invoking Claude CLI: ${this.claudeCliPath} ${claudeProcessArgs.join(' ')}`);
+
+      const startTime = Date.now();
+      const { stdout, stderr } = await spawnAsync(
+        this.claudeCliPath,
+        claudeProcessArgs,
+        {
+          timeout: 1800000, // 30 minutes
+          cwd
+        }
+      );
+
+      // Process successful result
+      const result = stdout.trim();
+      const executionTime = Date.now() - startTime;
+      console.error(`[Async] Task ${taskId} completed successfully`);
+      
+      // Complete task in memory with metrics
+      await memoryClient.completeTask(agentId, taskId, result, true, {
+        execution_time_ms: executionTime
+      });
+      
+      // If not elevated, cleanup will happen with the specified keepTaskBlocks count
+      if (!elevateBlock) {
+        await memoryClient.cleanupOldTaskBlocks(agentId, keepTaskBlocks);
+      }
+      
+      // Send result to Letta/Matrix
+      const message = `Task ${taskId} completed:\n\n${result}`;
+      await sendResultToLetta({
+        agentId,
+        taskId,
+        callbackUrl: lettaUrl,
+        result: message,
+        success: true
+      });
+      
+      // Clean up task tracker
+      taskTracker.removeTask(taskId);
+      
+    } catch (error: any) {
+      console.error(`[Async] Task ${taskId} failed:`, error);
+      
+      // Log error to memory
+      const taskError = {
+        timestamp: new Date().toISOString(),
+        error_type: 'system' as const,
+        message: error.message || 'Unknown error',
+        details: error.stack,
+        recoverable: false
+      };
+      await memoryClient.addTaskError(agentId, taskId, taskError);
+      
+      // Complete task as failed
+      await memoryClient.completeTask(agentId, taskId, error.message || 'Task failed', false);
+      
+      // Send error to Letta/Matrix
+      const errorMessage = error.message || 'Unknown error';
+      const message = `Task ${taskId} failed: ${errorMessage}`;
+      await sendResultToLetta({
+        agentId,
+        taskId,
+        callbackUrl: lettaUrl,
+        result: message,
+        success: false,
+        error: errorMessage
+      });
+      
+      // Clean up task tracker
+      taskTracker.removeTask(taskId);
+      
+      throw error;
+    }
   }
 
   /**

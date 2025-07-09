@@ -1,0 +1,7 @@
+{
+  "homeserver": "http://localhost:8008",
+  "user_id": "@your-bot:matrix.example.com",
+  "access_token": "your_matrix_bot_access_token_here",
+  "device_id": "bot_device_id",
+  "password": "your_secure_password_here"
+}

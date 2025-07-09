@@ -18,9 +18,20 @@ comparison-repo/
 .env.local
 .env.*.local
 
+# Bot configuration files
+bot_claudecode_config.json
+
 # Coverage reports
 coverage/
 
 # IDE
 .vscode/
 .idea/
+
+# Python virtual environment
+venv/
+env/
+.venv/
+__pycache__/
+*.pyc
+*.pyo
